@@ -17,9 +17,11 @@ class CheckContext:
     reference_price: Decimal | None
     """Last known price for the order's symbol, or ``None`` if there is none."""
     position: Decimal
-    """Account's current signed net position in the symbol (long > 0, short < 0)."""
-    gross_exposure: Decimal
-    """Account's current gross exposure: sum of |position| x reference price over all symbols."""
+    """Account's signed position in the symbol (long > 0, short < 0), counting open
+    orders on the same side as this one: the worst case in the order's direction."""
+    gross_exposure: Decimal | None
+    """Account's worst-case gross exposure across all symbols, or ``None`` if it
+    cannot be valued (a held symbol has no reference price)."""
     orders_in_window: int
     """Orders the account sent in the current rate window, including this one."""
 

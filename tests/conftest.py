@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from fakeredis import FakeAsyncRedis
+from fakeredis import FakeAsyncRedis, FakeServer
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
@@ -20,8 +20,21 @@ def settings(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-async def redis() -> AsyncIterator[FakeAsyncRedis]:
-    client = FakeAsyncRedis(decode_responses=True)
+def redis_server() -> FakeServer:
+    return FakeServer()
+
+
+@pytest.fixture
+async def redis(redis_server: FakeServer) -> AsyncIterator[FakeAsyncRedis]:
+    client = FakeAsyncRedis(server=redis_server, decode_responses=True)
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
+async def other_redis(redis_server: FakeServer) -> AsyncIterator[FakeAsyncRedis]:
+    """A second client on the same server, to play a concurrent writer."""
+    client = FakeAsyncRedis(server=redis_server, decode_responses=True)
     yield client
     await client.aclose()
 

@@ -174,3 +174,9 @@ class TestMaxGrossExposure:
     def test_market_without_reference_price_fails_closed(self) -> None:
         order = make_order(order_type=OrderType.MARKET)
         assert max_gross_exposure(make_ctx(order, reference_price=None)).status is FAIL
+
+    def test_unknown_current_exposure_fails_closed(self) -> None:
+        result = max_gross_exposure(make_ctx(gross_exposure=None))
+        assert result.status is FAIL
+        assert result.reason is not None
+        assert "unknown" in result.reason

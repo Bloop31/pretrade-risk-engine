@@ -43,7 +43,7 @@ def make_ctx(
     *,
     reference_price: Decimal | None = HUNDRED,
     position: Decimal = ZERO,
-    gross_exposure: Decimal = ZERO,
+    gross_exposure: Decimal | None = ZERO,
     orders_in_window: int = 1,
     **limit_overrides: Any,
 ) -> CheckContext:

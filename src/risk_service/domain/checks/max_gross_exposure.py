@@ -8,14 +8,22 @@ NAME = "max_gross_exposure"
 def max_gross_exposure(ctx: CheckContext) -> CheckResult:
     """The account's gross exposure after this order fills must stay within the limit.
 
-    The order changes exposure by ``(|position after| - |position before|) x price``.
-    As with ``max_position``, an order that reduces exposure is always allowed.
+    The order changes exposure by ``(|position after| - |position before|) x price``,
+    using the worst-case position in the order's direction. This can overstate the
+    increase when the account also has open orders on the other side, which errs
+    on the safe side. As with ``max_position``, an order that reduces exposure is
+    always allowed.
     """
     limit = ctx.limits.max_gross_exposure
     price = ctx.valuation_price
     if price is None:
         return CheckResult.failed(
             NAME, f"no reference price for {ctx.order.symbol} to value a MARKET order", limit=limit
+        )
+
+    if ctx.gross_exposure is None:
+        return CheckResult.failed(
+            NAME, "current exposure is unknown: a held symbol has no reference price", limit=limit
         )
 
     current_position = ctx.position
