@@ -69,11 +69,17 @@ class PriceResponse(DomainModel):
     price: DecimalStr
 
 
+class RejectedRulesFile(DomainModel):
+    problems: list[str]
+    rejected_at: datetime
+
+
 class RulesInfoResponse(DomainModel):
     version: str
     source: str
     loaded_at: datetime
     document: RulesDocument
+    rejected_file: RejectedRulesFile | None = None
 
 
 class ReloadResponse(DomainModel):

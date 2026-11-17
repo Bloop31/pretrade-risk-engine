@@ -28,7 +28,10 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=0.25, gt=0)
 
     rules_path: Path = Path("config/rules.yaml")
-    rules_reload_interval_seconds: float = Field(default=2.0, gt=0)
+    # Edits take effect within about two intervals (one to see the change, one to
+    # confirm the file has finished being written).
+    rules_reload_interval_seconds: float = Field(default=1.0, gt=0)
+    rules_watch_enabled: bool = True
 
     log_level: LogLevel = "INFO"
     log_json: bool = True

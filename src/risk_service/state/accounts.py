@@ -17,6 +17,7 @@ from redis.exceptions import WatchError
 
 from risk_service.domain.models import Decision, Order, RiskDecision, Side
 from risk_service.domain.positions import AccountSnapshot
+from risk_service.observability.metrics import RESERVATION_CONFLICTS
 from risk_service.state.codec import ZERO, decode, decode_hash, encode, text, text_hash
 from risk_service.state.errors import (
     CorruptStateError,
@@ -170,6 +171,7 @@ class AccountStore:
                 try:
                     return await attempt(pipe)
                 except WatchError:
+                    RESERVATION_CONFLICTS.inc()
                     continue
         raise StateContentionError(f"gave up after {self._max_attempts} conflicting attempts")
 

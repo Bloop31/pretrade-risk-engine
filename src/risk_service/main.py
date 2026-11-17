@@ -19,6 +19,7 @@ from risk_service.observability.logging import configure_logging, get_logger
 from risk_service.observability.middleware import ObservabilityMiddleware
 from risk_service.rules.loader import RulesError
 from risk_service.rules.store import RulesStore
+from risk_service.rules.watcher import RulesWatcher
 from risk_service.settings import Settings, get_settings
 
 log = get_logger(__name__)
@@ -54,16 +55,23 @@ def create_app(settings: Settings | None = None, *, redis_client: Redis | None =
 
         client = redis_client if redis_client is not None else create_redis(settings)
         app.state.services = Services.build(settings, client, rules)
+
+        watcher = RulesWatcher(rules, interval_seconds=settings.rules_reload_interval_seconds)
+        if settings.rules_watch_enabled:
+            watcher.start()
+
         log.info(
             "startup",
             version=__version__,
             rules_version=rules.current().version,
             rules_path=str(settings.rules_path),
+            rules_watch=settings.rules_watch_enabled,
             redis_url=_redact(str(settings.redis_url)),
         )
         try:
             yield
         finally:
+            await watcher.stop()
             if redis_client is None:
                 await client.aclose()
             log.info("shutdown")

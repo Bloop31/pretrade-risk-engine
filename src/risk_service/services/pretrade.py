@@ -1,5 +1,6 @@
 """The pre-trade check use case: gather state, run the engine, reserve on ACCEPT."""
 
+import time
 from collections.abc import Callable
 
 from redis.exceptions import RedisError
@@ -9,6 +10,12 @@ from risk_service.domain.engine import RiskEngine
 from risk_service.domain.models import CheckResult, Order, RiskDecision
 from risk_service.domain.positions import AccountSnapshot, gross_exposure
 from risk_service.observability.logging import get_logger
+from risk_service.observability.metrics import (
+    CHECK_FAILURES,
+    CHECK_LATENCY,
+    DECISIONS,
+    STATE_ERRORS,
+)
 from risk_service.rules.ruleset import RuleSet
 from risk_service.state.accounts import AccountStore
 from risk_service.state.errors import StateError
@@ -43,6 +50,15 @@ class PreTradeService:
         rejected with a ``risk_state`` check failure. Raises
         ``OrderLifecycleError`` for a duplicate ``client_order_id``.
         """
+        start = time.perf_counter()
+        decision = await self._check(order)
+        CHECK_LATENCY.observe(time.perf_counter() - start)
+        DECISIONS.labels(decision=decision.decision.value).inc()
+        for failed in decision.failed_checks:
+            CHECK_FAILURES.labels(check=failed.check).inc()
+        return decision
+
+    async def _check(self, order: Order) -> RiskDecision:
         rules = self._rules()  # one snapshot for the whole check, even across retries
         limits = rules.limits_for(order.account, order.symbol)
 
@@ -63,6 +79,7 @@ class PreTradeService:
 
             decision = await self._accounts.evaluate_and_reserve(order, decide)
         except (RedisError, StateError, OSError, TimeoutError) as exc:
+            STATE_ERRORS.labels(error=type(exc).__name__).inc()
             log.error(
                 "pretrade.state_unavailable",
                 client_order_id=order.client_order_id,

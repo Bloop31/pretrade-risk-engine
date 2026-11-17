@@ -38,6 +38,7 @@ def settings(rules_path: Path) -> Settings:
         rules_path=rules_path,
         log_json=False,
         admin_api_key=ADMIN_KEY,
+        rules_watch_enabled=False,  # watcher has its own tests; keep the rest deterministic
     )
 
 

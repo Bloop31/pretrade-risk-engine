@@ -7,23 +7,36 @@ from fastapi import APIRouter, Depends, Query, status
 
 from risk_service.api.deps import SYMBOL_PATTERN_ANY_CASE, RulesDep, require_admin
 from risk_service.api.errors import ErrorResponse
-from risk_service.api.schemas import EffectiveLimitsResponse, ReloadResponse, RulesInfoResponse
+from risk_service.api.schemas import (
+    EffectiveLimitsResponse,
+    RejectedRulesFile,
+    ReloadResponse,
+    RulesInfoResponse,
+)
 from risk_service.domain.models import ACCOUNT_PATTERN
-from risk_service.observability.logging import get_logger
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
-log = get_logger(__name__)
 
 
 @router.get("/rules")
 async def get_rules(rules: RulesDep) -> RulesInfoResponse:
-    """The rule set currently in force."""
+    """The rule set currently in force.
+
+    ``rejected_file`` is set when the file on disk has been edited but could not
+    be loaded: it lists the problems, and the rules shown here remain in force.
+    """
     current = rules.current()
+    failure = rules.last_error
     return RulesInfoResponse(
         version=current.version,
         source=current.source,
         loaded_at=current.loaded_at,
         document=current.document,
+        rejected_file=(
+            None
+            if failure is None
+            else RejectedRulesFile(problems=failure.problems, rejected_at=failure.at)
+        ),
     )
 
 
@@ -37,14 +50,7 @@ async def reload_rules(rules: RulesDep) -> ReloadResponse:
     If the file is invalid, returns 422 listing every problem, and the
     previous rules stay in force.
     """
-    result = await rules.reload()
-    log.info(
-        "rules.reloaded",
-        trigger="admin",
-        changed=result.changed,
-        version=result.version,
-        previous_version=result.previous_version,
-    )
+    result = await rules.reload(trigger="admin")
     return ReloadResponse(
         changed=result.changed, version=result.version, previous_version=result.previous_version
     )
