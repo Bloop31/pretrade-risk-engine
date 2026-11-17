@@ -9,13 +9,35 @@ from httpx import ASGITransport, AsyncClient
 from risk_service.main import create_app
 from risk_service.settings import Settings
 
+ADMIN_KEY = "test-admin-key"
+
+TEST_RULES = """\
+schema_version: 1
+defaults:
+  max_order_quantity: 1000
+  max_order_notional: 1000000
+  price_collar_pct: 5
+  max_position: 5000
+  max_gross_exposure: 10000000
+  max_orders_per_second: 1000
+restricted_symbols: [XYZ]
+"""
+
 
 @pytest.fixture
-def settings(tmp_path: Path) -> Settings:
+def rules_path(tmp_path: Path) -> Path:
+    path = tmp_path / "rules.yaml"
+    path.write_text(TEST_RULES, encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def settings(rules_path: Path) -> Settings:
     return Settings(
         _env_file=None,
-        rules_path=tmp_path / "rules.yaml",
+        rules_path=rules_path,
         log_json=False,
+        admin_api_key=ADMIN_KEY,
     )
 
 
@@ -52,3 +74,8 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http,
     ):
         yield http
+
+
+@pytest.fixture
+def admin_headers() -> dict[str, str]:
+    return {"X-Admin-Key": ADMIN_KEY}

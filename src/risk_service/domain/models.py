@@ -44,13 +44,17 @@ DecimalStr = Annotated[
 PositiveDecimal = Annotated[DecimalStr, Field(gt=0)]
 NonNegativeDecimal = Annotated[DecimalStr, Field(ge=0)]
 
+SYMBOL_PATTERN = r"^[A-Z0-9][A-Z0-9._/-]{0,31}$"
+ACCOUNT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+CLIENT_ORDER_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+
 Symbol = Annotated[
     str,
     BeforeValidator(_normalise_symbol),
-    Field(pattern=r"^[A-Z0-9][A-Z0-9._/-]{0,31}$", examples=["AAPL"]),
+    Field(pattern=SYMBOL_PATTERN, examples=["AAPL"]),
 ]
-AccountId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", examples=["ACC-1"])]
-ClientOrderId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")]
+AccountId = Annotated[str, Field(pattern=ACCOUNT_PATTERN, examples=["ACC-1"])]
+ClientOrderId = Annotated[str, Field(pattern=CLIENT_ORDER_ID_PATTERN, examples=["ord-0001"])]
 
 
 class DomainModel(BaseModel):
