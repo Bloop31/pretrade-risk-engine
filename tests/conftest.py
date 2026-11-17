@@ -13,7 +13,7 @@ from risk_service.settings import Settings
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         rules_path=tmp_path / "rules.yaml",
         log_json=False,
     )

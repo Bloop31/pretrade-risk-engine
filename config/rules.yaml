@@ -1,0 +1,60 @@
+# Pre-trade risk limits.
+#
+# Edit this file to change limits. The service reloads it automatically within a
+# few seconds. If the file has a mistake, the service keeps using the previous
+# valid version and logs exactly what is wrong. See docs/RULES.md for the guide.
+#
+# How limits are chosen for an order (most specific wins):
+#   defaults  ->  symbols.<SYMBOL>  ->  accounts.<ACCOUNT>  ->  accounts.<ACCOUNT>.symbols.<SYMBOL>
+#
+# Units:
+#   quantities                  number of shares / contracts
+#   notionals and exposure      quantity x price, in the account currency
+#   price_collar_pct            percent, e.g. 5 means "within 5% of the last price"
+#   max_orders_per_second       per account
+#
+# Limits are inclusive: an order exactly at a limit is accepted.
+
+schema_version: 1
+
+# Global kill switch. Set to false to reject every order.
+trading_enabled: true
+
+defaults:
+  max_order_quantity: 10000
+  max_order_notional: 1000000
+  price_collar_pct: 5
+  max_position: 50000
+  max_gross_exposure: 10000000
+  max_orders_per_second: 50
+
+# Nobody may trade these.
+restricted_symbols:
+  - XYZ
+
+# Per-symbol limits for every account.
+symbols:
+  TSLA:
+    max_order_quantity: 2000
+    price_collar_pct: 3
+  BRK.A:
+    max_order_quantity: 10
+    max_position: 50
+
+# Per-account limits. Anything not listed falls back to the levels above.
+accounts:
+  HEDGE-01:
+    max_gross_exposure: 50000000
+    max_orders_per_second: 200
+    symbols:
+      AAPL:
+        max_position: 200000
+
+  RETAIL-01:
+    max_order_notional: 50000
+    max_gross_exposure: 250000
+    restricted_symbols:
+      - GME
+
+  SUSPENDED-01:
+    trading_enabled: false
