@@ -1,92 +1,297 @@
 # Pre-Trade Risk Check Service
 
-Every order is checked against configurable risk limits **before** it is sent to
-the exchange. The service answers `ACCEPT` or `REJECT`, with a result for every
-check, in a few milliseconds. Limits live in [`config/rules.yaml`](config/rules.yaml),
-which business users can edit without touching code; edits are hot-reloaded
-without a restart.
+A synchronous pre-trade risk gateway. Every order is checked against configurable
+limits **before** it is routed to an execution venue. The service answers `ACCEPT`
+or `REJECT` with a per-check breakdown, and atomically **reserves** the accepted
+quantity against the account's position and exposure limits until it is filled or
+cancelled.
 
-```
- OMS ──► POST /v1/orders/check ──► ACCEPT ──► exchange
-                                └► REJECT (with reasons)
- fills / cancels ──► POST /v1/orders/{account}/{id}/fills | /cancel
- market data     ──► PUT  /v1/prices/{symbol}
-```
+Limits are held in a YAML rules file ([`config/rules.yaml`](config/rules.yaml)) owned
+by the risk desk and hot-reloaded without a restart. All prices, quantities and
+notionals are exact `Decimal` arithmetic end to end, and every failure mode
+**fails closed**.
 
-## Contents
-
-- [Quick start](#quick-start)
-- [The checks](#the-checks)
-- [API](#api)
-- [Changing limits](#changing-limits)
-- [How it works](#how-it-works)
-- [Securing it](#securing-it)
-- [Operating it](#operating-it)
-- [Development](#development)
-
-## Quick start
-
-With Docker:
-
-```bash
-make up                      # api on :8000 + redis:7, with development keys
-curl localhost:8000/health/ready
-RISK_API_KEY=dev-client-key-change-me make loadtest   # prints latency percentiles
-make down
+```mermaid
+flowchart LR
+    OMS[OMS / EMS] -->|POST /v1/orders/check| RS
+    DC[Drop copy] -->|fills / cancels| RS
+    MD[Market data] -->|PUT /v1/prices| RS
+    BK[Books of record] -->|start-of-day positions| RS
+    RD[Risk desk] -->|config/rules.yaml, hot reload| RS
+    RS[Risk service: 9 pure checks] -->|ACCEPT + reserve| V[Route to venue]
+    RS -->|REJECT + reasons| OMS
+    RS <-->|WATCH / MULTI| R[(Redis: positions, reservations, prices, rate windows)]
 ```
 
-Without Docker (needs a Redis on `REDIS_URL`, default `redis://localhost:6379/0`):
+**Contents:**
+[Controls](#risk-controls) ·
+[Regulatory mapping](#regulatory-mapping) ·
+[Risk model](#risk-model) ·
+[Decision semantics](#decision-semantics) ·
+[Order lifecycle](#order-lifecycle) ·
+[Consistency and concurrency](#consistency-and-concurrency) ·
+[Failure modes](#failure-modes) ·
+[Numerical precision](#numerical-precision) ·
+[API](#api) ·
+[Rules](#rules-configuration) ·
+[Architecture](#architecture) ·
+[Performance](#performance) ·
+[Security](#security) ·
+[Operations](#operations) ·
+[Limitations](#known-limitations) ·
+[Quick start](#quick-start) ·
+[Development](#development)
 
-```bash
-make install                 # uv sync --locked
-cp .env.example .env         # local defaults: API key check disabled
-make run                     # http://127.0.0.1:8000/docs for the OpenAPI UI
-```
+---
 
-Configuration is by environment variable; see [`.env.example`](.env.example).
+## Risk controls
 
-| Variable | Default | Meaning |
+Nine controls run on every order. They never short-circuit, so a rejection reports
+every breached limit at once. **All limits are inclusive**: a value exactly at the
+limit passes.
+
+| # | Check | Control type | Rejects when |
+|---|---|---|---|
+| 1 | `trading_enabled` | Kill switch | trading is halted firm-wide or for the account |
+| 2 | `restricted_symbol` | Restricted list | the symbol is on the global or the account's restricted list |
+| 3 | `order_rate` | Message throttle | the account has sent more than `max_orders_per_second` order checks in the trailing 1 s window |
+| 4 | `reference_price_fresh` | Market-data integrity | the symbol's reference price is older than `max_price_age_seconds`, or has no timestamp |
+| 5 | `max_order_quantity` | Fat-finger (size) | order quantity exceeds the limit |
+| 6 | `max_order_notional` | Fat-finger (value) | quantity × price exceeds the limit |
+| 7 | `price_collar` | Fat-finger (price) | a LIMIT price deviates from the reference price by more than `price_collar_pct` % |
+| 8 | `max_position` | Position limit | the worst-case net position in the symbol after the order would exceed the limit |
+| 9 | `max_gross_exposure` | Exposure limit | the account's worst-case gross exposure after the order would exceed the limit |
+
+Position and exposure limits count **open (accepted, unfilled) orders as well as
+fills**, so an account cannot exceed its limit by sending many orders that each fit
+on their own.
+
+## Regulatory mapping
+
+The controls correspond to the pre-trade control categories in the US Market
+Access Rule (SEC Rule 15c3-5) and the EU algorithmic-trading RTS (MiFID II RTS 6,
+Commission Delegated Regulation (EU) 2017/589). The table shows which control
+addresses which category and where the coverage is only partial.
+
+| Requirement | Control here | Coverage |
 |---|---|---|
-| `API_KEYS` | **required** | Client keys for `/v1/*`, sent as `X-API-Key`; comma-separated for rotation |
-| `API_AUTH_DISABLED` | `false` | `true` accepts `/v1/*` calls without a key (local development only) |
-| `ADMIN_API_KEY` | *(unset)* | Enables `/admin/*`; callers send it as `X-Admin-Key` |
-| `REDIS_URL` | `redis://localhost:6379/0` | Where positions, reservations, prices and rate counters live; `rediss://` for TLS |
-| `REDIS_PASSWORD` | *(unset)* | Redis password, kept out of the URL |
-| `RULES_PATH` | `config/rules.yaml` | The rules file |
-| `RULES_WATCH_ENABLED` | `true` | Hot-reload the rules file when it changes |
-| `RULES_RELOAD_INTERVAL_SECONDS` | `1.0` | How often to look for changes |
-| `LOG_LEVEL` / `LOG_JSON` | `INFO` / `true` | Logging |
-| `REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | Redis timeout; on timeout the order is rejected |
+| 15c3-5(c)(1)(ii): reject orders exceeding **size** parameters, order by order | `max_order_quantity`, `max_order_notional` | Full, per order |
+| 15c3-5(c)(1)(ii): reject orders exceeding **price** parameters | `price_collar` (+ `reference_price_fresh` so the collar is never anchored to a stale price) | LIMIT orders; MARKET orders are bounded by notional at the reference price |
+| 15c3-5(c)(1)(ii): limits "over a short period of time" | `order_rate` | Counts order checks per account; cancels and fills are not counted |
+| 15c3-5(c)(1)(ii): reject **duplicative** orders | `client_order_id` uniqueness (HTTP 409) | Partial: catches ID reuse while an order is open, not economically identical orders under new IDs |
+| 15c3-5(c)(1)(i): pre-set **credit / capital** thresholds | `max_position`, `max_gross_exposure` (including open orders) | Partial: exposure is notional at reference prices, not margin or credit usage, and is per account rather than per firm |
+| 15c3-5(c)(2): restricted securities | `restricted_symbol` | Global and per account |
+| RTS 6 Art. 15: price collars | `price_collar` | As above |
+| RTS 6 Art. 15: maximum order value / volume | `max_order_notional` / `max_order_quantity` | As above |
+| RTS 6 Art. 15: maximum messages limit | `order_rate` | Order checks only |
+| RTS 6 Art. 12: kill functionality | `trading_enabled` (global and per account), hot-reloaded | Halts new orders; does not cancel resting orders at the venue |
 
-## The checks
+> This mapping is engineering guidance, not legal advice. Deploying this service
+> does not by itself make a firm compliant. Supervisory procedures, limit
+> calibration, post-trade controls, reconciliation and record-keeping remain the
+> firm's responsibility.
 
-Every check runs on every order, so a rejection lists *all* the reasons at once.
-Limits are inclusive: an order exactly at a limit is accepted.
+## Risk model
 
-| Check | Rejects when | Notes |
+Notation for an order on account *a* in symbol *s*:
+
+| Symbol | Meaning |
+|---|---|
+| Q | order quantity (> 0) |
+| p | limit price (LIMIT orders) |
+| r | reference price for *s* (last price published to `/v1/prices`) |
+| v | valuation price: v = p for LIMIT, v = r for MARKET |
+| P | filled signed net position in *s* (long > 0, short < 0) |
+| B, S | open (reserved) BUY and SELL quantity in *s*, each ≥ 0 |
+
+### Worst-case position
+
+Open buys and open sells are tracked **separately and never netted**, because
+nothing guarantees both sides fill. The position an order is judged against is the
+worst case in the order's own direction:
+
+```
+q_cur = P + B      for a BUY
+q_cur = P − S      for a SELL
+
+q_new = q_cur + Q  for a BUY
+q_new = q_cur − Q  for a SELL
+```
+
+### Check formulas
+
+| Check | Passes when | Reported `value` |
 |---|---|---|
-| `trading_enabled` | trading is halted globally or for the account | kill switch |
-| `restricted_symbol` | the symbol is on a restricted list | global and per account |
-| `order_rate` | the account sent more than `max_orders_per_second` in the last second | counts every attempt, accepted or not |
-| `reference_price_fresh` | the symbol's reference price is older than `max_price_age_seconds` | guards against a dead market-data feed |
-| `max_order_quantity` | quantity > limit | fat-finger guard |
-| `max_order_notional` | quantity × price > limit | MARKET orders use the reference price |
-| `price_collar` | a LIMIT price is more than `price_collar_pct` % from the reference price | skipped for MARKET orders |
-| `max_position` | the position after the order would exceed the limit | orders that move towards flat always pass |
-| `max_gross_exposure` | the account's gross exposure after the order would exceed the limit | orders that reduce exposure always pass |
+| `order_rate` | n ≤ `max_orders_per_second`, where n = order checks in (t − 1000 ms, t], including this one | n |
+| `reference_price_fresh` | age(r) ≤ `max_price_age_seconds` | age in seconds (ms precision) |
+| `max_order_quantity` | Q ≤ L | Q |
+| `max_order_notional` | Q × v ≤ L | Q × v |
+| `price_collar` | \|p − r\| / r × 100 ≤ L (LIMIT only; SKIPPED for MARKET) | deviation %, shown to 4 dp |
+| `max_position` | \|q_new\| ≤ L, **or** \|q_new\| < \|q_cur\| (risk-reducing) | \|q_new\| |
+| `max_gross_exposure` | G + Δ ≤ L, **or** Δ ≤ 0 (risk-reducing) | G + Δ |
 
-Positions and exposure count **open orders as well as fills**, on a worst-case
-basis: open buys and open sells are tracked separately and never netted, since
-there is no guarantee both sides will fill.
+### Gross exposure
+
+The account's current worst-case gross exposure, valued at reference prices:
+
+```
+G = Σ over symbols s  of  max( |P_s + B_s| , |P_s − S_s| ) × r_s
+```
+
+The order's incremental exposure, valued at the order's valuation price:
+
+```
+Δ = ( |q_new| − |q_cur| ) × v
+```
+
+Because q_cur is the directional worst case, Δ can **overstate** the increase when
+the account also has open orders on the opposite side. That errs on the safe side.
+
+### Risk-reducing orders
+
+An order that moves the position toward flat (\|q_new\| < \|q_cur\|), or that
+reduces gross exposure (Δ ≤ 0), always passes the position and exposure checks.
+An account that is already over a limit, for example after the risk desk tightened
+it intraday, can still trade out of the position. A flip through zero is **not**
+treated as reducing unless the resulting absolute position is smaller: long 1,000
+to short 5,001 is an increase.
+
+## Decision semantics
+
+| Outcome | Rule |
+|---|---|
+| `ACCEPT` | at least one check ran, and none returned `FAIL` (`SKIPPED` does not block) |
+| `REJECT` | any check returned `FAIL`, or no checks ran at all (an empty engine rejects) |
+
+- **Every check is reported** with its `status` (`PASS` / `FAIL` / `SKIPPED`),
+  `reason`, `limit` and `value`, so the OMS can show the trader exactly what was
+  breached and by how much.
+- **Every decision carries `rules_version`,** a 12-hex-character SHA-256 prefix of
+  the rules file's bytes. With the decision logs, this lets you reconstruct which
+  limits were applied to any order.
+- **A REJECT is a successful check and returns HTTP 200.** Non-2xx codes are reserved
+  for malformed requests and infrastructure errors.
+
+## Order lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Checked: POST /v1/orders/check
+    Checked --> Rejected: any check FAIL
+    Checked --> Open: ACCEPT, quantity reserved
+    Open --> Open: partial fill, reserved qty moves into position
+    Open --> Filled: fill of the remaining qty
+    Open --> Cancelled: cancel, remainder released
+    Rejected --> [*]
+    Filled --> [*]
+    Cancelled --> [*]
+```
+
+| Event | Effect on state (atomic) |
+|---|---|
+| ACCEPT | B or S += Q; open-order record created with `remaining = Q` |
+| Fill of f ≤ remaining | P += f (BUY) or P −= f (SELL); B or S −= f; `remaining` −= f; record deleted at 0 |
+| Cancel | B or S −= remaining; record deleted |
+| Overfill (f > remaining) | refused with 409; nothing changes |
+| Start-of-day load | `PUT /v1/positions/{acct}/{sym}` overwrites P; reservations untouched |
+
+Feed **exchange rejects and expiries** through `/cancel` as well; otherwise their
+quantity stays reserved. A `client_order_id` can be reused once its previous order
+is closed. The API has no amend operation: send cancel/replace as a cancel followed
+by a new check.
+
+## Consistency and concurrency
+
+**Atomic check-and-reserve.** For each order the service:
+1. Opens an optimistic `WATCH` on the account's position, open-order and
+   order-record keys.
+2. Reads a consistent snapshot of those keys.
+3. Runs the checks.
+4. On ACCEPT, commits the reservation in `MULTI`/`EXEC`.
+
+If any other writer touches those keys in between, `EXEC` aborts and the order is
+re-decided from a fresh snapshot, for up to 20 attempts. **Two concurrent orders
+can never both pass a limit that only one of them fits under.** CI demonstrates
+this against a real `redis:7`: 50 simultaneous 1,000-share orders against a 5,000
+position limit accept exactly 5, and the test asserts the race was actually
+contended.
+
+```mermaid
+sequenceDiagram
+    participant OMS
+    participant Svc as Risk service
+    participant R as Redis
+    OMS->>Svc: POST /v1/orders/check
+    Svc->>R: rate window (ZREMRANGEBYSCORE, ZADD, ZCARD in MULTI)
+    Svc->>R: WATCH positions, open orders, order record
+    Svc->>R: EXISTS order record, HGETALL positions, HGETALL open orders
+    Svc->>R: HMGET prices and price timestamps
+    Note over Svc: run 9 pure checks on the snapshot
+    alt ACCEPT
+        Svc->>R: MULTI, HSET reservation, HSET order record, EXEC
+        R-->>Svc: nil if a watched key changed
+        Note over Svc,R: on nil, re-read and re-decide (max 20 attempts)
+    end
+    Svc-->>OMS: ACCEPT or REJECT, per-check results, rules_version
+```
+
+- **Rules snapshot isolation.** An order reads the rule set once and uses it for
+  every check and every retry. It is never evaluated against a mix of old and new
+  limits.
+- **Redis Cluster.** Per-account keys share an `{account}` hash tag, so the
+  transaction stays in a single slot.
+- **Multiple instances** share all state through Redis. Each instance hot-reloads
+  the rules file independently, so for about two seconds after an edit, instances
+  may apply different versions. `rules_version` on each decision records which one
+  was used.
+
+## Failure modes
+
+The service never answers ACCEPT unless it could positively establish that the
+order is within limits.
+
+| Condition | Behaviour |
+|---|---|
+| Redis unreachable, timed out (default 250 ms), or erroring | `REJECT`, single check `risk_state` |
+| Corrupt value in Redis (non-numeric, non-finite, malformed record) | `REJECT`, `risk_state` |
+| Transaction still contended after 20 attempts | `REJECT`, `risk_state` |
+| No reference price for the order's symbol | `price_collar` FAIL (LIMIT); `max_order_notional` and `max_gross_exposure` FAIL (MARKET) |
+| Reference price older than `max_price_age_seconds` | `reference_price_fresh` FAIL |
+| Reference price without a timestamp | `reference_price_fresh` FAIL (age unknown) |
+| A held symbol has no price (exposure cannot be valued) | `max_gross_exposure` FAIL |
+| A check raises an exception | that check FAILs with "internal error"; the error is logged |
+| Rules file invalid at startup | the process refuses to start |
+| Rules file invalid on reload | previous rules stay in force; `risk_rules_file_valid` = 0; problems listed at `/admin/rules` |
+| Rules file missing on reload | previous rules stay in force; logged once |
+| Duplicate open `client_order_id` | HTTP 409; nothing reserved (the attempt still counts toward `order_rate`) |
+
+## Numerical precision
+
+- **`Decimal` end to end.**
+  - Prices, quantities, notionals and limits are Python `Decimal` from the wire to
+    Redis and back.
+  - The API accepts decimals as **JSON strings** (`"187.25"`) or integers. A JSON
+    number with a fraction is **rejected with 422**, because the JSON parser has
+    already rounded it through an IEEE-754 double: `0.1000000000000000055` arrives
+    as `0.1`.
+  - Responses serialise as plain decimal strings, never exponent notation.
+- **YAML rules are parsed from source text** directly to `Decimal`, so `0.1` is
+  exactly `0.1`. `.inf` and `.nan` are rejected.
+- **Redis stores canonical decimal strings.** Arithmetic is done in Python under a
+  `WATCH`, never with `HINCRBYFLOAT` or Lua (whose numbers are doubles).
+- **Context.**
+  - Python's default decimal context applies: 28 significant digits,
+    `ROUND_HALF_EVEN`.
+  - Checks only add, subtract and multiply inputs, except two divisions: the collar
+    deviation, compared at full precision and reported quantised to 4 dp, and the
+    price age in seconds, which divides by 1,000 and is exact.
+- **Guard rail.** A test parses every module in `domain/` and `rules/` and fails on
+  any use of `float`.
 
 ## API
 
-Interactive docs at `/docs` (use "Authorize" to enter a key). Every `/v1/*` call
-needs `X-API-Key`; `/admin/*` needs `X-Admin-Key`; health and metrics are open.
-All prices and quantities are **strings**
-(`"187.25"`), or integers. JSON numbers with a fraction are rejected with 422,
-because by the time they are parsed they have already been rounded through a
-binary float.
+OpenAPI UI at `/docs`. `/v1/*` requires `X-API-Key`, and `/admin/*` requires
+`X-Admin-Key`. Health and metrics endpoints are open.
 
 ### Check an order
 
@@ -98,6 +303,9 @@ curl -X POST localhost:8000/v1/orders/check \
 }'
 ```
 
+With AAPL's reference price at 175, the 187.25 limit price sits 7% away, outside the
+default 5% collar:
+
 ```json
 {
   "client_order_id": "ord-0001",
@@ -106,202 +314,336 @@ curl -X POST localhost:8000/v1/orders/check \
   "decision": "REJECT",
   "rules_version": "3f9c2a1b7d0e",
   "checks": [
-    {"check": "trading_enabled",    "status": "PASS", "reason": null, "limit": null,      "value": null},
-    {"check": "restricted_symbol",  "status": "PASS", "reason": null, "limit": null,      "value": null},
-    {"check": "order_rate",         "status": "PASS", "reason": null, "limit": "50",      "value": "1"},
-    {"check": "reference_price_fresh", "status": "PASS", "reason": null, "limit": "30",   "value": "0.84"},
-    {"check": "max_order_quantity", "status": "PASS", "reason": null, "limit": "10000",   "value": "100"},
-    {"check": "max_order_notional", "status": "PASS", "reason": null, "limit": "1000000", "value": "18725.00"},
-    {"check": "price_collar",       "status": "FAIL",
+    {"check": "trading_enabled",       "status": "PASS", "reason": null, "limit": null,       "value": null},
+    {"check": "restricted_symbol",     "status": "PASS", "reason": null, "limit": null,       "value": null},
+    {"check": "order_rate",            "status": "PASS", "reason": null, "limit": "50",       "value": "1"},
+    {"check": "reference_price_fresh", "status": "PASS", "reason": null, "limit": "30",       "value": "0.84"},
+    {"check": "max_order_quantity",    "status": "PASS", "reason": null, "limit": "10000",    "value": "100"},
+    {"check": "max_order_notional",    "status": "PASS", "reason": null, "limit": "1000000",  "value": "18725.00"},
+    {"check": "price_collar",          "status": "FAIL",
      "reason": "price 187.25 is 7.0000% from the reference price 175, outside the 5% collar",
      "limit": "5", "value": "7.0000"},
-    {"check": "max_position",       "status": "PASS", "reason": null, "limit": "50000",   "value": "100"},
-    {"check": "max_gross_exposure", "status": "PASS", "reason": null, "limit": "10000000","value": "18725.00"}
+    {"check": "max_position",          "status": "PASS", "reason": null, "limit": "50000",    "value": "100"},
+    {"check": "max_gross_exposure",    "status": "PASS", "reason": null, "limit": "10000000", "value": "18725.00"}
   ]
 }
 ```
 
-A REJECT is a successful check, so it is **HTTP 200**. On ACCEPT the order's
-quantity is reserved against the account's limits until it is filled or
-cancelled. `rules_version` identifies exactly which rules file made the decision.
+### Order fields
+
+| Field | Type | Constraints |
+|---|---|---|
+| `client_order_id` | string | `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`; unique per account while open |
+| `account` | string | `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, case-sensitive |
+| `symbol` | string | up to 32 characters, normalised to upper case |
+| `side` | enum | `BUY`, `SELL` |
+| `order_type` | enum | `LIMIT` (requires `price`), `MARKET` (must omit `price`) |
+| `quantity` | decimal string | > 0, finite |
+| `price` | decimal string | > 0, finite; LIMIT only |
+
+Unknown fields are rejected, so a misspelt field never passes silently.
 
 ### Endpoints
 
-| Method | Path | |
+| Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/orders/check` | Check an order (reserves on ACCEPT) |
-| `GET` | `/v1/orders/{account}/{client_order_id}` | An open order |
-| `POST` | `/v1/orders/{account}/{client_order_id}/fills` | `{"quantity": "40"}`: record an execution |
-| `POST` | `/v1/orders/{account}/{client_order_id}/cancel` | Release the unfilled remainder |
-| `GET` | `/v1/positions/{account}` | Positions, open orders and gross exposure |
-| `PUT` | `/v1/positions/{account}/{symbol}` | `{"quantity": "-200"}`: load a position (e.g. start of day) |
-| `GET` | `/v1/prices`, `/v1/prices/{symbol}` | Reference prices |
-| `PUT` | `/v1/prices/{symbol}` | `{"price": "187.25"}` |
-| `GET` | `/admin/rules` | Rules in force (and a rejected file's problems, if any) |
-| `POST` | `/admin/rules/reload` | Reload now |
-| `GET` | `/admin/rules/limits?account=&symbol=` | The exact limits an order would get |
-| `GET` | `/health/live`, `/health/ready`, `/metrics` | Probes and Prometheus |
+| `POST` | `/v1/orders/check` | Pre-trade check; reserves on ACCEPT |
+| `GET` | `/v1/orders/{account}/{client_order_id}` | Open order (quantity, remaining) |
+| `POST` | `/v1/orders/{account}/{client_order_id}/fills` | `{"quantity": "40"}`: apply an execution |
+| `POST` | `/v1/orders/{account}/{client_order_id}/cancel` | Release the unfilled remainder (cancel, reject, expiry) |
+| `GET` | `/v1/positions/{account}` | Filled positions, open buys and sells, worst-case gross exposure |
+| `PUT` | `/v1/positions/{account}/{symbol}` | `{"quantity": "-200"}`: overwrite filled position (start of day) |
+| `GET` | `/v1/prices`, `/v1/prices/{symbol}` | Reference prices with `updated_at` |
+| `PUT` | `/v1/prices/{symbol}` | `{"price": "187.25"}`: publish a reference price (timestamped on receipt) |
+| `GET` | `/admin/rules` | Rules in force, version, load time, and a rejected file's problems if any |
+| `POST` | `/admin/rules/reload` | Reload now (422 with every problem if invalid) |
+| `GET` | `/admin/rules/limits?account=&symbol=` | Effective limits for an (account, symbol) pair |
+| `GET` | `/health/live`, `/health/ready` | Liveness; readiness (pings Redis) |
+| `GET` | `/metrics` | Prometheus exposition |
 
-Errors share one shape, `{"error": "<code>", "detail": ...}`:
+### Errors
+
+Error bodies have the shape `{"error": "<code>", "detail": ...}`. 401 and
+validation errors use FastAPI's `{"detail": ...}`.
 
 | Status | `error` | When |
 |---|---|---|
-| 401 | *(detail only)* | missing or wrong `X-API-Key` / `X-Admin-Key` |
+| 401 | — | missing or invalid `X-API-Key` / `X-Admin-Key` |
+| 403 | — | admin API disabled (`ADMIN_API_KEY` unset) |
 | 404 | `unknown_order` | fill or cancel for an order that is not open |
 | 409 | `duplicate_order` | `client_order_id` already open for the account |
-| 409 | `overfill` | fill larger than the order's remaining quantity |
-| 422 | *(validation)* / `invalid_rules` | bad request body; rules file rejected on reload |
-| 503 | `state_unavailable` | Redis unreachable (non-check endpoints) |
+| 409 | `overfill` | fill exceeds the order's remaining quantity |
+| 422 | — / `invalid_rules` | invalid request body / rules file rejected on reload |
+| 503 | `state_unavailable` | Redis unavailable (all endpoints except `/check`, which REJECTs instead) |
 
-## Changing limits
+## Rules configuration
 
-See **[docs/RULES.md](docs/RULES.md)**, written for the people who own the limits.
-In short: edit `config/rules.yaml`, save, and the change applies within about
-two seconds. A file with a mistake is never applied; the service keeps the last
-good rules and shows what is wrong at `GET /admin/rules`.
+The risk desk owns [`config/rules.yaml`](config/rules.yaml). The full guide for
+non-developers is [docs/RULES.md](docs/RULES.md).
 
-## How it works
+```yaml
+schema_version: 1
+trading_enabled: true            # firm-wide kill switch
+
+defaults:                        # every limit must be set here
+  max_order_quantity: 10000
+  max_order_notional: 1000000
+  price_collar_pct: 5
+  max_position: 50000
+  max_gross_exposure: 10000000
+  max_orders_per_second: 50
+  max_price_age_seconds: 30
+
+restricted_symbols: [XYZ]
+
+symbols:                         # per-symbol overrides, all accounts
+  TSLA: {max_order_quantity: 2000, price_collar_pct: 3}
+
+accounts:                        # per-account overrides
+  HEDGE-01:
+    max_gross_exposure: 50000000
+    symbols:
+      AAPL: {max_position: 200000}
+  SUSPENDED-01:
+    trading_enabled: false       # account kill switch
+```
+
+**Resolution order:** the most specific level wins.
+
+```
+defaults  <  symbols[s]  <  accounts[a]  <  accounts[a].symbols[s]
+```
+
+`max_gross_exposure` and `max_orders_per_second` are account-level limits and are
+rejected if placed under a symbol.
+
+**Validation.** A file is applied only if it passes every rule below; otherwise
+every problem is reported, each with its path (for example
+`symbols.AAPL.max_order_qty: Extra inputs are not permitted`).
+- Unknown keys are errors.
+- Every default is required, so nothing is unlimited by omission.
+- Limits must be positive. `max_position` and `max_gross_exposure` may be 0,
+  meaning reduce-only.
+- `price_collar_pct` must be in (0, 100].
+- Duplicate keys, including `aapl` and `AAPL`, are errors.
+- Only `true`/`false` are booleans, so tickers such as `ON` or `NO` stay strings.
+
+**Hot reload.**
+- The file is polled every second (`RULES_RELOAD_INTERVAL_SECONDS`).
+- A change is applied only once it is stable across two polls, so a half-written
+  save is never read.
+- The new rule set is validated in full and then swapped in atomically.
+- A given broken file is attempted, logged and counted once, not once per poll.
+
+## Architecture
 
 ```
 src/risk_service/
-  main.py          app factory; lifespan loads rules, opens Redis, starts the watcher
-  container.py     the objects built at startup
-  settings.py      environment config
-  api/             HTTP routers, schemas, error mapping, admin auth
-  services/        PreTradeService: rules + state + engine for one order
-  domain/          pure logic, no I/O: models, the nine checks, engine, exposure
-  rules/           YAML schema and loader, RulesStore (atomic swap), RulesWatcher
-  state/           Redis stores: prices, positions and reservations, rate limiter
-  observability/   structlog setup, Prometheus metrics, request-ID middleware
+├── main.py            app factory; lifespan: load rules → Redis pool → start watcher
+├── container.py       long-lived objects built at startup
+├── settings.py        environment configuration (pydantic-settings)
+├── clock.py           injectable millisecond clock
+├── api/               routers, request/response schemas, error mapping, API-key auth
+├── services/
+│   └── pretrade.py    one check: rules snapshot + state + engine, fail-closed, metrics
+├── domain/            pure, no I/O
+│   ├── models.py      Order, CheckResult, RiskDecision, Decimal wire types
+│   ├── limits.py      EffectiveLimits for one (account, symbol)
+│   ├── positions.py   AccountSnapshot, worst-case quantity, gross exposure
+│   ├── engine.py      runs every check, fails closed on exceptions
+│   └── checks/        one module per control
+├── rules/             schema, hardened YAML loader, RuleSet resolution, RulesStore, RulesWatcher
+├── state/             Redis: key layout, Decimal codec, prices, positions/reservations, rate limiter
+└── observability/     structlog JSON logging, Prometheus metrics, request-ID middleware
 ```
 
-**Decimal everywhere.** Money and quantities are `Decimal` end to end: parsed
-from strings in JSON, stored as strings in Redis, and read from YAML text
-without passing through a float. A test fails if `float` appears anywhere in
-`domain/` or `rules/`.
+- **Pure checks.** Every control is a function `CheckContext → CheckResult` over an
+  immutable snapshot, with no I/O. That makes boundary testing exhaustive and cheap
+  (at the limit, one tick over, risk-reducing, flip through zero), and it means a
+  check cannot block or partially fail. Adding a control means adding one module and
+  one line in `DEFAULT_CHECKS`.
+- **Redis data model.** All values are canonical decimal strings.
 
-**Pure checks.** Each check is a function of an immutable snapshot (order,
-limits, reference price, position, exposure, rate count). They are trivial to
-test exhaustively at their boundaries and cannot do I/O.
+| Key | Type | Contents |
+|---|---|---|
+| `risk:prices` | hash | symbol → reference price |
+| `risk:prices:updated_ms` | hash | symbol → receipt time (Unix ms) |
+| `risk:{acct}:positions` | hash | symbol → filled signed position |
+| `risk:{acct}:open` | hash | `BUY:<sym>` / `SELL:<sym>` → reserved quantity |
+| `risk:{acct}:order:<id>` | hash | symbol, side, quantity, remaining, rules_version |
+| `risk:{acct}:rate` | zset | order-check timestamps in the trailing window |
 
-**Atomic check-and-reserve.** The decision and the reservation commit in one
-Redis `WATCH`/`MULTI` transaction over the account's keys. If any concurrent
-writer touches the account in between, the transaction aborts and the order is
-re-decided against fresh state. Two orders can never both squeeze under a limit
-only one of them fits. Keys carry an `{account}` hash tag, so this also holds on
-Redis Cluster.
+## Performance
 
-**Fail closed.** If Redis is down or slow, a stored value is corrupt, a held
-symbol has no price, or a check throws, the order is rejected with a stated
-reason. The service refuses to start with an invalid rules file.
+The check is on the order's critical path, so latency is dominated by Redis round
+trips rather than computation.
 
-**Safe hot reload.** The watcher polls the file and only reads it once it has
-stopped changing, so a half-saved file is never read. A new file is fully
-validated before it replaces the old one, and each order uses one rules
-snapshot from start to finish.
-
-## Securing it
-
-**Client keys.** Every `/v1/*` endpoint requires `X-API-Key`, including
-`/v1/orders/check`: an unauthenticated caller could otherwise place
-reservations against an account's limits and block its trading. Set
-`API_KEYS` to one or more keys (at least 16 characters each). The service
-refuses to start without them unless `API_AUTH_DISABLED=true`, which is meant
-for local development and logs a warning at startup. To rotate a key, deploy
-with `API_KEYS=old,new`, move clients to `new`, then remove `old`. Keys are
-compared in constant time.
-
-**Admin key.** `/admin/*` uses its own `ADMIN_API_KEY` (`X-Admin-Key`), so the
-OMS and the market-data feed never hold the key that can reload rules. A client
-key does not open the admin API, and vice versa.
-
-**Redis over TLS, with a password.** Use a `rediss://` URL. TLS options go in its
-query string, and the password can come from a secret store instead of the URL:
-
-```bash
-REDIS_URL='rediss://risk-service@redis.internal:6380/0?ssl_cert_reqs=required&ssl_ca_certs=/etc/ssl/redis-ca.pem'
-REDIS_PASSWORD='...'   # from your secret store; a password inside REDIS_URL takes precedence
-```
-
-**Least-privilege Redis user.** [`deploy/redis-acl-rules`](deploy/redis-acl-rules)
-lists exactly the commands the service sends, restricted to its own `risk:*`
-keys. Create the user with:
-
-```bash
-( set -f   # keep ~risk:* from being glob-expanded by the shell
-  redis-cli ACL SETUSER risk-service on '>STRONG-PASSWORD' $(grep -v '^#' deploy/redis-acl-rules) )
-```
-
-CI creates a user from that same file and runs the real-Redis tests as it, so
-the file cannot fall out of date without CI failing.
-
-**What is still on you.** Run the service on a private network or behind your
-gateway, terminate HTTPS in front of it (the service itself speaks plain HTTP),
-and keep `/metrics` off the public internet.
-
-## Operating it
-
-**Health.** `/health/live` means the process is serving; `/health/ready` also
-pings Redis (503 when it cannot).
-
-**Metrics** (`/metrics`). No metric is labelled by account or symbol.
-
-| Metric | Use |
+| Path | Redis round trips |
 |---|---|
-| `risk_decisions_total{decision}` | accept/reject rate |
-| `risk_check_failures_total{check}` | which limits are biting |
-| `risk_check_duration_seconds` | decision latency (buckets from 0.5 ms) |
-| `risk_state_errors_total{error}` | orders rejected because Redis was unusable; alert on any |
-| `risk_reservation_conflicts_total` | concurrent orders on one account retried |
-| `risk_rules_file_valid` | 0 = someone saved a broken rules file; alert on it |
-| `risk_rules_reloads_total{trigger,result}` | reload history |
-| `risk_rules_info{version}` | rules version in force |
+| ACCEPT | 7: rate window, WATCH, EXISTS, 2 × HGETALL, price pipeline, MULTI/EXEC |
+| REJECT | 7: the same reads, then UNWATCH instead of a commit |
+| Each `WATCH` conflict | +6 per retry: re-WATCH, re-read, re-EXEC |
 
-**Logs** are JSON on stdout, one line per event, each tagged with the request's
-`x-request-id` (taken from the caller if supplied).
+End-to-end latency is therefore about 7 × the Redis RTT plus a sub-millisecond
+CPU cost. Co-locate the service with Redis. The checks themselves are pure
+in-memory `Decimal` arithmetic.
 
-**Scaling.** All state is in Redis, so run as many instances or workers
-(`WEB_CONCURRENCY`) as needed. Each instance hot-reloads the rules file itself;
-during a reload, instances can disagree for up to about two seconds, and
-`rules_version` on each decision records which rules were used.
+`risk_check_duration_seconds` has buckets from 0.5 ms. Measure your own deployment
+with the load generator:
 
-**Persistence.** The compose file runs Redis with AOF (`appendfsync everysec`),
-so reservations and positions survive a restart. Positions here are the
-service's working view; reload them from the books of record at start of day
-with `PUT /v1/positions/...`.
+```bash
+RISK_API_KEY=... make loadtest ARGS="--url http://host:8000 --requests 20000 --concurrency 64 --accounts 200"
+```
 
-**Stale prices.** `reference_price_fresh` rejects every order in a symbol whose
-price has not been updated within `max_price_age_seconds`. If the market-data
-feed stops, trading in the affected symbols stops with it, which is the point.
-Outside market hours, either keep publishing closing prices or raise the limit.
+It reports throughput, p50 / p90 / p99 / p99.9 / max latency, the decision mix and
+failures by check. It cancels accepted orders and refreshes prices every 5 s, so it
+measures a steady state. CI runs it against the Docker Compose stack on every push.
 
-**Load test.** `RISK_API_KEY=... make loadtest ARGS="--requests 20000 --concurrency 64 --url http://host:8000"`
-prints throughput, p50/p90/p99/p99.9 latency and the decision mix. It refreshes
-prices every 5 seconds while it runs, as a feed would. CI runs it
-against the compose stack on every push.
+## Security
+
+- **Client authentication.**
+  - Every `/v1/*` endpoint requires `X-API-Key`. That includes `/check`: an
+    unauthenticated caller could otherwise place reservations that consume an
+    account's limits and block its trading.
+  - Keys are set in `API_KEYS`, comma-separated to allow rotation (`old,new`, then
+    drop `old`), at least 16 characters each, and compared in constant time.
+  - The process refuses to start without keys unless `API_AUTH_DISABLED=true`,
+    which is meant for local development and logs a warning.
+- **Separation of duties.** `/admin/*` uses a separate `ADMIN_API_KEY`. The OMS and
+  the market-data feed never hold the key that reloads limits, and neither key
+  opens the other's endpoints.
+- **Redis.**
+  - TLS via `rediss://` with options in the URL query, for example
+    `?ssl_cert_reqs=required&ssl_ca_certs=/etc/ssl/ca.pem`.
+  - `REDIS_PASSWORD` keeps the secret out of the URL.
+  - [`deploy/redis-acl-rules`](deploy/redis-acl-rules) is a least-privilege ACL:
+    only the commands the service sends, only on `risk:*` keys. CI runs the
+    real-Redis tests as a user created from that file, so it cannot drift.
+
+    ```bash
+    ( set -f; redis-cli ACL SETUSER risk-service on '>STRONG-PASSWORD' $(grep -v '^#' deploy/redis-acl-rules) )
+    ```
+- **Your responsibility.** Terminate TLS in front of the service (it speaks plain
+  HTTP), keep it on a private network, and keep `/metrics` internal.
+
+## Operations
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `API_KEYS` | **required** | client keys for `/v1/*` |
+| `API_AUTH_DISABLED` | `false` | accept `/v1/*` without a key (local development only) |
+| `ADMIN_API_KEY` | unset | enables `/admin/*` |
+| `REDIS_URL` | `redis://localhost:6379/0` | `rediss://` for TLS |
+| `REDIS_PASSWORD` | unset | Redis password; one inside `REDIS_URL` takes precedence |
+| `REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | per-operation timeout; on timeout the order is REJECTed |
+| `RULES_PATH` | `config/rules.yaml` | rules file |
+| `RULES_WATCH_ENABLED` | `true` | hot reload |
+| `RULES_RELOAD_INTERVAL_SECONDS` | `1.0` | poll interval |
+| `LOG_LEVEL` / `LOG_JSON` | `INFO` / `true` | logging |
+| `WEB_CONCURRENCY` | 1 | uvicorn worker processes (all state is in Redis) |
+
+### Metrics and alerting
+
+No metric is labelled by account or symbol, so series cardinality stays bounded.
+
+| Metric | Suggested alert |
+|---|---|
+| `risk_state_errors_total{error}` | any increase: orders are being rejected because Redis is unusable |
+| `risk_rules_file_valid` | `== 0`: a broken rules file was saved and is not in force |
+| `risk_check_failures_total{check="reference_price_fresh"}` | rising during market hours: market-data feed stalled |
+| `risk_check_duration_seconds` | p99 above your latency budget |
+| `risk_reservation_conflicts_total` | sustained high rate: hot accounts contending |
+| `risk_decisions_total{decision}` | reject ratio outside its normal band |
+| `risk_rules_reloads_total{trigger,result}` | audit of limit changes |
+| `risk_rules_info{version}`, `risk_rules_loaded_timestamp_seconds` | which limits are live, and since when |
+
+### Logs and audit
+
+- **Format.** JSON lines on stdout. Each line carries the `x-request-id`, which is
+  taken from the caller when supplied, so you can correlate with OMS logs.
+- **Per-decision log.** Every decision logs `client_order_id`, account, symbol,
+  decision, failed checks and `rules_version`.
+- **Rules history.** Reloads log the old and new versions together with what
+  triggered them.
+
+### Persistence and start of day
+
+- **Redis persistence.** The Compose file runs Redis with AOF
+  (`appendfsync everysec`), so positions and reservations survive a restart with up
+  to about one second of loss.
+- **Not the book of record.** The service holds a working view of positions. Load
+  start-of-day positions from your books with `PUT /v1/positions/...` and reconcile
+  against the drop copy.
+- **After hours.** `reference_price_fresh` stops trading in any symbol whose feed
+  goes quiet. Outside market hours, keep publishing closing prices or raise
+  `max_price_age_seconds`.
+
+## Known limitations
+
+Know these before going live:
+
+| Area | Limitation |
+|---|---|
+| Instruments | Notional is quantity × price. There are no contract multipliers, lot sizes or tick-size checks, so futures and options need the multiplier folded into price or quantity. |
+| Currency | Single currency: all symbols and limits are assumed to be in one currency, with no FX conversion. |
+| Credit | Exposure is gross notional at reference prices, not margin, buying power or credit usage, and it is per account with no firm-wide or group aggregate. |
+| Exposure prices | Price staleness is enforced for the order's own symbol only. Other held symbols are valued at their last price, however old (missing prices still fail closed). |
+| Order types | LIMIT and MARKET only. No amend endpoint (use cancel + new check); no stop or iceberg semantics. |
+| Short selling | No locate or borrow check. |
+| Throttle | `order_rate` counts order checks, not cancels or amends, and uses each instance's clock. |
+| Rules rollout | Instances reload independently, so for about 2 s after an edit, instances may disagree (recorded in `rules_version`). |
+| Audit | Decisions are logged, not persisted to a queryable store. |
+
+## Quick start
+
+**Docker** (API on :8000 with `redis:7`, using development keys):
+
+```bash
+docker compose up --build -d
+```
+
+Then open `http://localhost:8000/docs`, click **Authorize**, and enter
+`dev-client-key-change-me`. Publish a price before sending orders:
+`PUT /v1/prices/AAPL` with `{"price": "100"}`.
+
+**Without Docker** you need a Redis on `localhost:6379`:
+
+```bash
+make install
+cp .env.example .env
+make run
+```
+
+The `.env.example` defaults disable the API-key check for local use.
 
 ## Development
 
 ```bash
-make install     # dependencies from uv.lock
-make fmt         # ruff fix + format
-make check       # lint + mypy --strict + tests: what CI runs
+make check       # ruff lint + format check, mypy --strict on src/, pytest with coverage
+make fmt         # auto-fix and format
 ```
 
-Tests use fakeredis by default. Set `REDIS_TEST_URL` to an **empty** Redis
-database to also run the concurrency tests against a real server (CI does this
-with a `redis:7` service container):
+- **Unit tests** cover every control at its boundaries: exactly at the limit, just
+  over, risk-reducing, and a flip through zero.
+- **State and API tests** run against fakeredis through the real FastAPI app.
+- **Real-Redis tests** cover truly concurrent orders, fills and cancels, run as the
+  least-privilege ACL user. Set `REDIS_TEST_URL` to an **empty** database to run
+  them; they refuse a non-empty one.
 
 ```bash
 REDIS_TEST_URL=redis://localhost:6379/15 make test
 ```
 
-### Windows notes
+- **CI** (GitHub Actions) has two jobs: lint, typecheck and the full test suite
+  against `redis:7`; then a Docker image build, Compose smoke test (including an
+  unauthenticated-request check) and the load test.
 
-- Keep the virtualenv out of OneDrive-synced folders:
+**Windows notes.**
+- Keep the virtualenv outside OneDrive with
   `$env:UV_PROJECT_ENVIRONMENT = "$HOME\.venvs\pre-trade"`.
-- If Smart App Control blocks the `pytest.exe` / `mypy.exe` launchers, run
-  `uv run python -m pytest` and `uv run python -m mypy`. If it blocks the
-  uv-downloaded Python, install the signed CPython 3.12 from python.org.
-- `make` is not installed by default; the Makefile targets are one-line `uv`
-  commands that can be run directly.
+- If Smart App Control blocks the `pytest.exe` / `mypy.exe` launchers, use
+  `uv run python -m pytest` / `-m mypy`.
+- `make` is not installed by default; each target is a one-line `uv` command in
+  the [Makefile](Makefile).
