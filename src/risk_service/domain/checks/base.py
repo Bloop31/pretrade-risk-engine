@@ -16,6 +16,8 @@ class CheckContext:
     limits: EffectiveLimits
     reference_price: Decimal | None
     """Last known price for the order's symbol, or ``None`` if there is none."""
+    reference_price_age_ms: int | None
+    """How old ``reference_price`` is, or ``None`` if unknown (or there is no price)."""
     position: Decimal
     """Account's signed position in the symbol (long > 0, short < 0), counting open
     orders on the same side as this one: the worst case in the order's direction."""

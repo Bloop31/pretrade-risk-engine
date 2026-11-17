@@ -11,6 +11,7 @@ from risk_service.domain.checks import (
     max_position,
     order_rate,
     price_collar,
+    reference_price_fresh,
     restricted_symbol,
     trading_enabled,
 )
@@ -52,6 +53,31 @@ class TestOrderRate:
         assert result.status is status
         assert result.value == D(count)
         assert result.limit == D(10)
+
+
+class TestReferencePriceFresh:
+    @pytest.mark.parametrize(
+        ("age_ms", "status"), [(0, PASS), (29_999, PASS), (30_000, PASS), (30_001, FAIL)]
+    )
+    def test_boundary(self, age_ms: int, status: CheckStatus) -> None:
+        result = reference_price_fresh(make_ctx(reference_price_age_ms=age_ms))
+        assert result.status is status
+        assert result.limit == D(30)
+        assert result.value == D(age_ms) / 1000
+
+    def test_reports_age_in_seconds(self) -> None:
+        result = reference_price_fresh(make_ctx(reference_price_age_ms=45_250))
+        assert result.reason == "reference price for AAPL is 45.25s old, older than the 30s limit"
+
+    def test_unknown_age_fails_closed(self) -> None:
+        result = reference_price_fresh(make_ctx(reference_price_age_ms=None))
+        assert result.status is FAIL
+        assert result.reason is not None
+        assert "no timestamp" in result.reason
+
+    def test_no_price_is_left_to_the_price_checks(self) -> None:
+        result = reference_price_fresh(make_ctx(reference_price=None, reference_price_age_ms=None))
+        assert result.status is SKIPPED
 
 
 class TestMaxOrderQuantity:

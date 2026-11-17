@@ -14,7 +14,7 @@ from risk_service.rules.ruleset import RuleSet
 from risk_service.services.pretrade import STATE_CHECK, PreTradeService
 from risk_service.state.accounts import AccountStore
 from risk_service.state.errors import DuplicateOrderError
-from risk_service.state.keys import positions_key
+from risk_service.state.keys import PRICES_KEY, positions_key
 from risk_service.state.prices import PriceStore
 from risk_service.state.rate import RateLimiter
 from tests.factories import make_order
@@ -30,6 +30,7 @@ defaults:
   max_position: 5000
   max_gross_exposure: 10000000
   max_orders_per_second: 1000
+  max_price_age_seconds: 30
 accounts:
   SLOW:
     max_orders_per_second: 2
@@ -46,24 +47,75 @@ def accounts(redis: FakeAsyncRedis) -> AccountStore:
     return AccountStore(redis, max_attempts=100)
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now_ms = 1_700_000_000_000
+
+    def __call__(self) -> int:
+        return self.now_ms
+
+
 @pytest.fixture
-async def prices(redis: FakeAsyncRedis) -> PriceStore:
-    store = PriceStore(redis)
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+async def prices(redis: FakeAsyncRedis, clock: FakeClock) -> PriceStore:
+    store = PriceStore(redis, clock=clock)
     await store.set("AAPL", D(100))
     return store
 
 
 @pytest.fixture
 def service(
-    redis: FakeAsyncRedis, rules: RuleSet, accounts: AccountStore, prices: PriceStore
+    redis: FakeAsyncRedis,
+    rules: RuleSet,
+    accounts: AccountStore,
+    prices: PriceStore,
+    clock: FakeClock,
 ) -> PreTradeService:
     return PreTradeService(
         engine=RiskEngine(),
         rules=lambda: rules,
         accounts=accounts,
         prices=prices,
-        rate_limiter=RateLimiter(redis),
+        rate_limiter=RateLimiter(redis, clock=clock),
+        clock=clock,
     )
+
+
+async def test_price_exactly_at_max_age_is_fresh(
+    service: PreTradeService, clock: FakeClock
+) -> None:
+    clock.now_ms += 30_000
+    decision = await service.check(make_order())
+    assert decision.decision is Decision.ACCEPT
+
+
+async def test_stale_price_rejects(
+    service: PreTradeService, accounts: AccountStore, clock: FakeClock
+) -> None:
+    clock.now_ms += 30_001
+    decision = await service.check(make_order())
+    assert decision.decision is Decision.REJECT
+    assert [c.check for c in decision.failed_checks] == ["reference_price_fresh"]
+    assert (await accounts.snapshot("ACC-1")).open_buys == {}
+
+
+async def test_untimestamped_price_rejects(service: PreTradeService, redis: FakeAsyncRedis) -> None:
+    await redis.hset(PRICES_KEY, "MSFT", "400")  # written without a timestamp
+    decision = await service.check(make_order(symbol="MSFT", price=D(400)))
+    assert [c.check for c in decision.failed_checks] == ["reference_price_fresh"]
+
+
+async def test_price_from_a_clock_ahead_of_ours_counts_as_fresh(
+    service: PreTradeService, prices: PriceStore, clock: FakeClock
+) -> None:
+    clock.now_ms += 5_000
+    await prices.set("AAPL", D(100))  # writer stamped at +5s
+    clock.now_ms -= 5_000  # our clock is 5s behind the writer's
+    assert (await service.check(make_order())).decision is Decision.ACCEPT
 
 
 async def test_accept_reserves(service: PreTradeService, accounts: AccountStore) -> None:

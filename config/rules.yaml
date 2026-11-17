@@ -12,6 +12,7 @@
 #   notionals and exposure      quantity x price, in the account currency
 #   price_collar_pct            percent, e.g. 5 means "within 5% of the last price"
 #   max_orders_per_second       per account
+#   max_price_age_seconds       reject if the last market price is older than this
 #
 # Limits are inclusive: an order exactly at a limit is accepted.
 
@@ -27,6 +28,7 @@ defaults:
   max_position: 50000
   max_gross_exposure: 10000000
   max_orders_per_second: 50
+  max_price_age_seconds: 30
 
 # Nobody may trade these.
 restricted_symbols:

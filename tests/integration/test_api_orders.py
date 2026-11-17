@@ -34,7 +34,8 @@ async def test_accepted_order(client: AsyncClient) -> None:
     assert body["client_order_id"] == "ord-1"
     assert len(body["rules_version"]) == 12
     checks = {c["check"]: c for c in body["checks"]}
-    assert len(checks) == 8
+    assert len(checks) == 9
+    assert checks["reference_price_fresh"]["status"] == "PASS"
     assert checks["max_order_notional"] == {
         "check": "max_order_notional",
         "status": "PASS",

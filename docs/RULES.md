@@ -23,6 +23,7 @@ defaults:                  # apply to everyone unless overridden below
   max_position: 50000
   max_gross_exposure: 10000000
   max_orders_per_second: 50
+  max_price_age_seconds: 30
 
 restricted_symbols:        # nobody may trade these
   - XYZ
@@ -53,6 +54,7 @@ All limits are **inclusive**: an order exactly at the limit is accepted.
 | `max_position` | The largest position an account may hold in one symbol, long or short, counting orders not yet filled. | `50000`: holding 49,000 and buying 2,000 is rejected. |
 | `max_gross_exposure` | The most an account may have at risk across all symbols: the total value of all its positions, long and short added together. | `10000000` |
 | `max_orders_per_second` | How many orders one account may send per second. | `50` |
+| `max_price_age_seconds` | How old the last market price may be. If prices stop arriving (a feed outage), orders in that symbol are rejected rather than checked against an out-of-date price. | `30`: with no price update for 31 seconds, orders are rejected. |
 
 Two more settings:
 
@@ -61,6 +63,9 @@ Two more settings:
 | `trading_enabled: false` | top of the file | Stops **all** trading. |
 | `trading_enabled: false` | under an account | Stops that account only. |
 | `restricted_symbols` | top of the file, or under an account | Symbols that may not be traded, by anyone or by that account. |
+
+`max_price_age_seconds` can be set per symbol too: an illiquid symbol that
+updates rarely may need a longer limit than a busy one.
 
 Orders that **reduce** risk are always allowed through the position and
 exposure limits, even if the account is already over them. If you lower a

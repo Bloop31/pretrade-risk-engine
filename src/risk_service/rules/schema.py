@@ -42,6 +42,7 @@ class SymbolLimits(_RulesModel):
     max_order_notional: PositiveDecimal | None = None
     price_collar_pct: CollarPct | None = None
     max_position: NonNegativeDecimal | None = None
+    max_price_age_seconds: PositiveInt | None = None
 
 
 class AccountLimits(SymbolLimits):
@@ -60,6 +61,7 @@ class Defaults(_RulesModel):
     max_position: NonNegativeDecimal
     max_gross_exposure: NonNegativeDecimal
     max_orders_per_second: PositiveInt
+    max_price_age_seconds: PositiveInt
 
 
 LIMIT_FIELDS: frozenset[str] = frozenset(Defaults.model_fields)

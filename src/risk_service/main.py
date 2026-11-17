@@ -26,8 +26,16 @@ log = get_logger(__name__)
 
 
 def create_redis(settings: Settings) -> Redis:
+    """Connection pool from ``REDIS_URL``.
+
+    TLS and its options come from the URL itself (``rediss://...?ssl_ca_certs=...``);
+    ``REDIS_PASSWORD`` supplies the password when the URL does not carry one.
+    """
+    password = settings.redis_password
+    # redis-py applies options parsed from the URL over these keyword arguments.
     return Redis.from_url(
         str(settings.redis_url),
+        password=password.get_secret_value() if password is not None else None,
         decode_responses=True,
         socket_timeout=settings.redis_socket_timeout_seconds,
         socket_connect_timeout=settings.redis_socket_timeout_seconds,
@@ -67,7 +75,10 @@ def create_app(settings: Settings | None = None, *, redis_client: Redis | None =
             rules_path=str(settings.rules_path),
             rules_watch=settings.rules_watch_enabled,
             redis_url=_redact(str(settings.redis_url)),
+            api_keys=len(settings.api_key_values),
         )
+        if settings.api_auth_disabled:
+            log.warning("startup.api_auth_disabled", detail="/v1 endpoints accept any caller")
         try:
             yield
         finally:

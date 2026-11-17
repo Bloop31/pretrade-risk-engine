@@ -20,6 +20,7 @@ without a restart.
 - [API](#api)
 - [Changing limits](#changing-limits)
 - [How it works](#how-it-works)
+- [Securing it](#securing-it)
 - [Operating it](#operating-it)
 - [Development](#development)
 
@@ -28,9 +29,9 @@ without a restart.
 With Docker:
 
 ```bash
-make up                      # api on :8000 + redis:7
+make up                      # api on :8000 + redis:7, with development keys
 curl localhost:8000/health/ready
-make loadtest                # 5000 checks, prints latency percentiles
+RISK_API_KEY=dev-client-key-change-me make loadtest   # prints latency percentiles
 make down
 ```
 
@@ -38,6 +39,7 @@ Without Docker (needs a Redis on `REDIS_URL`, default `redis://localhost:6379/0`
 
 ```bash
 make install                 # uv sync --locked
+cp .env.example .env         # local defaults: API key check disabled
 make run                     # http://127.0.0.1:8000/docs for the OpenAPI UI
 ```
 
@@ -45,11 +47,14 @@ Configuration is by environment variable; see [`.env.example`](.env.example).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REDIS_URL` | `redis://localhost:6379/0` | Where positions, reservations, prices and rate counters live |
+| `API_KEYS` | **required** | Client keys for `/v1/*`, sent as `X-API-Key`; comma-separated for rotation |
+| `API_AUTH_DISABLED` | `false` | `true` accepts `/v1/*` calls without a key (local development only) |
+| `ADMIN_API_KEY` | *(unset)* | Enables `/admin/*`; callers send it as `X-Admin-Key` |
+| `REDIS_URL` | `redis://localhost:6379/0` | Where positions, reservations, prices and rate counters live; `rediss://` for TLS |
+| `REDIS_PASSWORD` | *(unset)* | Redis password, kept out of the URL |
 | `RULES_PATH` | `config/rules.yaml` | The rules file |
 | `RULES_WATCH_ENABLED` | `true` | Hot-reload the rules file when it changes |
 | `RULES_RELOAD_INTERVAL_SECONDS` | `1.0` | How often to look for changes |
-| `ADMIN_API_KEY` | *(unset)* | Enables `/admin/*`; callers send it as `X-Admin-Key` |
 | `LOG_LEVEL` / `LOG_JSON` | `INFO` / `true` | Logging |
 | `REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | Redis timeout; on timeout the order is rejected |
 
@@ -63,6 +68,7 @@ Limits are inclusive: an order exactly at a limit is accepted.
 | `trading_enabled` | trading is halted globally or for the account | kill switch |
 | `restricted_symbol` | the symbol is on a restricted list | global and per account |
 | `order_rate` | the account sent more than `max_orders_per_second` in the last second | counts every attempt, accepted or not |
+| `reference_price_fresh` | the symbol's reference price is older than `max_price_age_seconds` | guards against a dead market-data feed |
 | `max_order_quantity` | quantity > limit | fat-finger guard |
 | `max_order_notional` | quantity × price > limit | MARKET orders use the reference price |
 | `price_collar` | a LIMIT price is more than `price_collar_pct` % from the reference price | skipped for MARKET orders |
@@ -75,7 +81,9 @@ there is no guarantee both sides will fill.
 
 ## API
 
-Interactive docs at `/docs`. All prices and quantities are **strings**
+Interactive docs at `/docs` (use "Authorize" to enter a key). Every `/v1/*` call
+needs `X-API-Key`; `/admin/*` needs `X-Admin-Key`; health and metrics are open.
+All prices and quantities are **strings**
 (`"187.25"`), or integers. JSON numbers with a fraction are rejected with 422,
 because by the time they are parsed they have already been rounded through a
 binary float.
@@ -83,7 +91,8 @@ binary float.
 ### Check an order
 
 ```bash
-curl -X POST localhost:8000/v1/orders/check -H 'content-type: application/json' -d '{
+curl -X POST localhost:8000/v1/orders/check \
+  -H "X-API-Key: $RISK_API_KEY" -H 'content-type: application/json' -d '{
   "client_order_id": "ord-0001", "account": "ACC-1", "symbol": "AAPL",
   "side": "BUY", "order_type": "LIMIT", "quantity": "100", "price": "187.25"
 }'
@@ -100,6 +109,7 @@ curl -X POST localhost:8000/v1/orders/check -H 'content-type: application/json' 
     {"check": "trading_enabled",    "status": "PASS", "reason": null, "limit": null,      "value": null},
     {"check": "restricted_symbol",  "status": "PASS", "reason": null, "limit": null,      "value": null},
     {"check": "order_rate",         "status": "PASS", "reason": null, "limit": "50",      "value": "1"},
+    {"check": "reference_price_fresh", "status": "PASS", "reason": null, "limit": "30",   "value": "0.84"},
     {"check": "max_order_quantity", "status": "PASS", "reason": null, "limit": "10000",   "value": "100"},
     {"check": "max_order_notional", "status": "PASS", "reason": null, "limit": "1000000", "value": "18725.00"},
     {"check": "price_collar",       "status": "FAIL",
@@ -136,6 +146,7 @@ Errors share one shape, `{"error": "<code>", "detail": ...}`:
 
 | Status | `error` | When |
 |---|---|---|
+| 401 | *(detail only)* | missing or wrong `X-API-Key` / `X-Admin-Key` |
 | 404 | `unknown_order` | fill or cancel for an order that is not open |
 | 409 | `duplicate_order` | `client_order_id` already open for the account |
 | 409 | `overfill` | fill larger than the order's remaining quantity |
@@ -158,7 +169,7 @@ src/risk_service/
   settings.py      environment config
   api/             HTTP routers, schemas, error mapping, admin auth
   services/        PreTradeService: rules + state + engine for one order
-  domain/          pure logic, no I/O: models, the eight checks, engine, exposure
+  domain/          pure logic, no I/O: models, the nine checks, engine, exposure
   rules/           YAML schema and loader, RulesStore (atomic swap), RulesWatcher
   state/           Redis stores: prices, positions and reservations, rate limiter
   observability/   structlog setup, Prometheus metrics, request-ID middleware
@@ -188,6 +199,45 @@ reason. The service refuses to start with an invalid rules file.
 stopped changing, so a half-saved file is never read. A new file is fully
 validated before it replaces the old one, and each order uses one rules
 snapshot from start to finish.
+
+## Securing it
+
+**Client keys.** Every `/v1/*` endpoint requires `X-API-Key`, including
+`/v1/orders/check`: an unauthenticated caller could otherwise place
+reservations against an account's limits and block its trading. Set
+`API_KEYS` to one or more keys (at least 16 characters each). The service
+refuses to start without them unless `API_AUTH_DISABLED=true`, which is meant
+for local development and logs a warning at startup. To rotate a key, deploy
+with `API_KEYS=old,new`, move clients to `new`, then remove `old`. Keys are
+compared in constant time.
+
+**Admin key.** `/admin/*` uses its own `ADMIN_API_KEY` (`X-Admin-Key`), so the
+OMS and the market-data feed never hold the key that can reload rules. A client
+key does not open the admin API, and vice versa.
+
+**Redis over TLS, with a password.** Use a `rediss://` URL. TLS options go in its
+query string, and the password can come from a secret store instead of the URL:
+
+```bash
+REDIS_URL='rediss://risk-service@redis.internal:6380/0?ssl_cert_reqs=required&ssl_ca_certs=/etc/ssl/redis-ca.pem'
+REDIS_PASSWORD='...'   # from your secret store; a password inside REDIS_URL takes precedence
+```
+
+**Least-privilege Redis user.** [`deploy/redis-acl-rules`](deploy/redis-acl-rules)
+lists exactly the commands the service sends, restricted to its own `risk:*`
+keys. Create the user with:
+
+```bash
+( set -f   # keep ~risk:* from being glob-expanded by the shell
+  redis-cli ACL SETUSER risk-service on '>STRONG-PASSWORD' $(grep -v '^#' deploy/redis-acl-rules) )
+```
+
+CI creates a user from that same file and runs the real-Redis tests as it, so
+the file cannot fall out of date without CI failing.
+
+**What is still on you.** Run the service on a private network or behind your
+gateway, terminate HTTPS in front of it (the service itself speaks plain HTTP),
+and keep `/metrics` off the public internet.
 
 ## Operating it
 
@@ -220,8 +270,14 @@ so reservations and positions survive a restart. Positions here are the
 service's working view; reload them from the books of record at start of day
 with `PUT /v1/positions/...`.
 
-**Load test.** `make loadtest ARGS="--requests 20000 --concurrency 64 --url http://host:8000"`
-prints throughput, p50/p90/p99/p99.9 latency and the decision mix. CI runs it
+**Stale prices.** `reference_price_fresh` rejects every order in a symbol whose
+price has not been updated within `max_price_age_seconds`. If the market-data
+feed stops, trading in the affected symbols stops with it, which is the point.
+Outside market hours, either keep publishing closing prices or raise the limit.
+
+**Load test.** `RISK_API_KEY=... make loadtest ARGS="--requests 20000 --concurrency 64 --url http://host:8000"`
+prints throughput, p50/p90/p99/p99.9 latency and the decision mix. It refreshes
+prices every 5 seconds while it runs, as a feed would. CI runs it
 against the compose stack on every push.
 
 ## Development

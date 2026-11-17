@@ -9,7 +9,8 @@ from httpx import ASGITransport, AsyncClient
 from risk_service.main import create_app
 from risk_service.settings import Settings
 
-ADMIN_KEY = "test-admin-key"
+ADMIN_KEY = "test-admin-key-0001"
+API_KEY = "test-client-key-0001"
 
 TEST_RULES = """\
 schema_version: 1
@@ -20,6 +21,7 @@ defaults:
   max_position: 5000
   max_gross_exposure: 10000000
   max_orders_per_second: 1000
+  max_price_age_seconds: 30
 restricted_symbols: [XYZ]
 """
 
@@ -38,6 +40,7 @@ def settings(rules_path: Path) -> Settings:
         rules_path=rules_path,
         log_json=False,
         admin_api_key=ADMIN_KEY,
+        api_keys=API_KEY,
         rules_watch_enabled=False,  # watcher has its own tests; keep the rest deterministic
     )
 
@@ -72,7 +75,11 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     # httpx's ASGITransport does not run the lifespan, so drive it explicitly.
     async with (
         app.router.lifespan_context(app),
-        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http,
+        AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"X-API-Key": API_KEY},
+        ) as http,
     ):
         yield http
 

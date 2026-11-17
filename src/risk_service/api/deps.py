@@ -3,7 +3,8 @@
 import secrets
 from typing import Annotated, cast
 
-from fastapi import Depends, Header, HTTPException, Path, Request, status
+from fastapi import Depends, HTTPException, Path, Request, Security, status
+from fastapi.security import APIKeyHeader
 from redis.asyncio import Redis
 
 from risk_service.container import Services
@@ -71,25 +72,49 @@ def _symbol(
 
 SymbolPath = Annotated[str, Depends(_symbol)]
 
-# ------------------------------------------------------------------ admin auth
+# ------------------------------------------------------------------------- auth
+# Declared as security schemes so /docs shows an "Authorize" button for each.
 
+API_KEY_HEADER = "X-API-Key"
 ADMIN_KEY_HEADER = "X-Admin-Key"
+
+_api_key = APIKeyHeader(name=API_KEY_HEADER, scheme_name="ApiKey", auto_error=False)
+_admin_key = APIKeyHeader(name=ADMIN_KEY_HEADER, scheme_name="AdminKey", auto_error=False)
+
+
+def _matches_any(supplied: str, keys: tuple[str, ...]) -> bool:
+    # Compare against every key, with no early exit, so timing reveals nothing.
+    candidate = supplied.encode()
+    matched = False
+    for key in keys:
+        matched |= secrets.compare_digest(candidate, key.encode())
+    return matched
+
+
+def _unauthorized(header: str) -> HTTPException:
+    return HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        f"missing or invalid {header} header",
+        headers={"WWW-Authenticate": "ApiKey"},
+    )
+
+
+def require_api_key(
+    settings: SettingsDep, supplied: Annotated[str | None, Security(_api_key)]
+) -> None:
+    if settings.api_auth_disabled:
+        return
+    if supplied is None or not _matches_any(supplied, settings.api_key_values):
+        raise _unauthorized(API_KEY_HEADER)
 
 
 def require_admin(
-    settings: SettingsDep,
-    x_admin_key: Annotated[str | None, Header(alias=ADMIN_KEY_HEADER)] = None,
+    settings: SettingsDep, supplied: Annotated[str | None, Security(_admin_key)]
 ) -> None:
     expected = settings.admin_api_key
     if expected is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "admin API is disabled: set ADMIN_API_KEY to enable it"
         )
-    if x_admin_key is None or not secrets.compare_digest(
-        x_admin_key.encode(), expected.get_secret_value().encode()
-    ):
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
-            f"missing or invalid {ADMIN_KEY_HEADER} header",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
+    if supplied is None or not _matches_any(supplied, (expected.get_secret_value(),)):
+        raise _unauthorized(ADMIN_KEY_HEADER)

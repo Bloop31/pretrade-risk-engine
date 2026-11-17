@@ -1,12 +1,14 @@
 """Account positions: inspect, and load start-of-day positions."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
-from risk_service.api.deps import AccountPath, AccountsDep, PricesDep, SymbolPath
+from risk_service.api.deps import AccountPath, AccountsDep, PricesDep, SymbolPath, require_api_key
 from risk_service.api.schemas import AccountPositionsResponse, PositionResponse, SetPositionRequest
 from risk_service.domain.positions import gross_exposure
 
-router = APIRouter(prefix="/v1/positions", tags=["positions"])
+router = APIRouter(
+    prefix="/v1/positions", tags=["positions"], dependencies=[Depends(require_api_key)]
+)
 
 
 @router.get("/{account}")
@@ -15,7 +17,8 @@ async def get_positions(
 ) -> AccountPositionsResponse:
     """Filled positions, open-order reservations and worst-case gross exposure."""
     snapshot = await accounts.snapshot(account)
-    current_prices = await prices.get_many(snapshot.symbols())
+    quotes = await prices.get_many(snapshot.symbols())
+    current_prices = {symbol: quote.price for symbol, quote in quotes.items()}
     return AccountPositionsResponse(
         account=account,
         positions=dict(snapshot.positions),

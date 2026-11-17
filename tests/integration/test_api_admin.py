@@ -7,7 +7,7 @@ from httpx import ASGITransport, AsyncClient
 from risk_service.main import create_app
 from risk_service.rules.loader import RulesError
 from risk_service.settings import Settings
-from tests.conftest import TEST_RULES
+from tests.conftest import API_KEY, TEST_RULES
 
 
 def _write(path: Path, text: str) -> None:
@@ -35,7 +35,7 @@ async def test_admin_requires_key(client: AsyncClient, headers: dict[str, str]) 
 async def test_admin_disabled_without_configured_key(
     rules_path: Path, redis: FakeAsyncRedis
 ) -> None:
-    settings = Settings(_env_file=None, rules_path=rules_path, log_json=False)
+    settings = Settings(_env_file=None, rules_path=rules_path, log_json=False, api_keys=API_KEY)
     app = create_app(settings, redis_client=redis)
     async with (
         app.router.lifespan_context(app),
@@ -111,7 +111,9 @@ async def test_effective_limits(client: AsyncClient, admin_headers: dict[str, st
 async def test_startup_fails_on_invalid_rules(tmp_path: Path, redis: FakeAsyncRedis) -> None:
     bad = tmp_path / "bad.yaml"
     _write(bad, "schema_version: 1\n")
-    app = create_app(Settings(_env_file=None, rules_path=bad), redis_client=redis)
+    app = create_app(
+        Settings(_env_file=None, rules_path=bad, api_auth_disabled=True), redis_client=redis
+    )
     with pytest.raises(RulesError, match="defaults"):
         async with app.router.lifespan_context(app):
             pass

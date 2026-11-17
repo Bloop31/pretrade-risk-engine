@@ -5,7 +5,7 @@ percentiles, throughput and the decision mix. Accepted orders are cancelled
 straight away (unless ``--no-cancel``) so reservations do not pile up and the
 service is measured in a steady state.
 
-    uv run python scripts/loadtest.py --url http://localhost:8000 --requests 20000 --concurrency 64
+    RISK_API_KEY=... uv run python scripts/loadtest.py --url http://localhost:8000 --requests 20000
 
 Orders are spread over ``--accounts`` accounts so the per-account rate limit
 (``max_orders_per_second`` in config/rules.yaml) is not the only thing measured.
@@ -14,6 +14,7 @@ Orders are spread over ``--accounts`` accounts so the per-account rate limit
 import argparse
 import asyncio
 import itertools
+import os
 import random
 import statistics
 import time
@@ -42,6 +43,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--accounts", type=int, default=50, help="distinct accounts to spread over")
     parser.add_argument("--no-cancel", action="store_true", help="leave accepted orders open")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("RISK_API_KEY"),
+        help="client key sent as X-API-Key (default: $RISK_API_KEY)",
+    )
     return parser.parse_args()
 
 
@@ -49,6 +55,12 @@ async def _seed_prices(client: httpx.AsyncClient) -> None:
     for i, symbol in enumerate(SYMBOLS):
         response = await client.put(f"/v1/prices/{symbol}", json={"price": f"{100 + 10 * i}"})
         response.raise_for_status()
+
+
+async def _refresh_prices(client: httpx.AsyncClient, every_seconds: float = 5.0) -> None:
+    while True:
+        await asyncio.sleep(every_seconds)
+        await _seed_prices(client)
 
 
 def _order(rng: random.Random, accounts: int) -> dict[str, str]:
@@ -135,9 +147,15 @@ async def main() -> int:
     limits = httpx.Limits(
         max_connections=args.concurrency, max_keepalive_connections=args.concurrency
     )
-    async with httpx.AsyncClient(base_url=args.url, limits=limits, timeout=10) as client:
+    headers = {"X-API-Key": args.api_key} if args.api_key else {}
+    async with httpx.AsyncClient(
+        base_url=args.url, limits=limits, timeout=10, headers=headers
+    ) as client:
         (await client.get("/health/ready")).raise_for_status()
         await _seed_prices(client)
+        # Keep prices fresh, like a market-data feed would, so a long run is not
+        # measured against the stale-price check.
+        refresher = asyncio.create_task(_refresh_prices(client))
 
         orders: asyncio.Queue[dict[str, str]] = asyncio.Queue()
         for order in itertools.islice(
@@ -150,6 +168,7 @@ async def main() -> int:
         await asyncio.gather(
             *(_worker(client, orders, stats, not args.no_cancel) for _ in range(args.concurrency))
         )
+        refresher.cancel()
         _report(stats, time.perf_counter() - start, args)
     return 1 if stats.errors else 0
 

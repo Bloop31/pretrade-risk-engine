@@ -1,15 +1,22 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fakeredis import FakeServer
 from httpx import AsyncClient
 
 
 async def test_price_round_trip_normalises_symbol(client: AsyncClient) -> None:
+    before = datetime.now(UTC)
     put = await client.put("/v1/prices/aapl", json={"price": "187.123456789"})
     assert put.status_code == 200
-    assert put.json() == {"symbol": "AAPL", "price": "187.123456789"}
+    body = put.json()
+    assert body["symbol"] == "AAPL"
+    assert body["price"] == "187.123456789"
+    updated_at = datetime.fromisoformat(body["updated_at"])
+    assert before - timedelta(seconds=1) <= updated_at <= datetime.now(UTC) + timedelta(seconds=1)
 
     get = await client.get("/v1/prices/AAPL")
-    assert get.json() == {"symbol": "AAPL", "price": "187.123456789"}
+    assert get.json() == body
 
 
 async def test_list_prices_sorted(client: AsyncClient) -> None:

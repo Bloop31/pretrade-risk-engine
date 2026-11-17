@@ -18,6 +18,7 @@ defaults:
   max_position: 5000
   max_gross_exposure: 1000000
   max_orders_per_second: 10
+  max_price_age_seconds: 30
 """
 
 

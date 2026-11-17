@@ -1,0 +1,7 @@
+# Least-privilege Redis ACL rules for the risk service (Redis 7+).
+# Grants exactly the commands the service sends, on its own keys only.
+# CI creates a user from this file and runs the real-Redis tests as that user.
+#
+#   ACL SETUSER risk-service on >STRONG-PASSWORD <the rules line below>
+#
+~risk:* resetchannels -@all +ping +select +client|setinfo +hget +hset +hdel +hgetall +hmget +exists +del +zadd +zcard +zremrangebyscore +pexpire +watch +unwatch +multi +exec +discard

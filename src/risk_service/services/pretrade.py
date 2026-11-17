@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 from redis.exceptions import RedisError
 
+from risk_service.clock import Clock, now_ms
 from risk_service.domain.checks import CheckContext
 from risk_service.domain.engine import RiskEngine
 from risk_service.domain.models import CheckResult, Order, RiskDecision
@@ -19,12 +20,19 @@ from risk_service.observability.metrics import (
 from risk_service.rules.ruleset import RuleSet
 from risk_service.state.accounts import AccountStore
 from risk_service.state.errors import StateError
-from risk_service.state.prices import PriceStore
+from risk_service.state.prices import PriceStore, Quote
 from risk_service.state.rate import RateLimiter
 
 log = get_logger(__name__)
 
 STATE_CHECK = "risk_state"
+
+
+def _age_ms(quote: Quote | None, now: int) -> int | None:
+    if quote is None or quote.updated_at_ms is None:
+        return None
+    # A writer whose clock runs slightly ahead must not produce a negative age.
+    return max(0, now - quote.updated_at_ms)
 
 
 class PreTradeService:
@@ -36,12 +44,14 @@ class PreTradeService:
         accounts: AccountStore,
         prices: PriceStore,
         rate_limiter: RateLimiter,
+        clock: Clock = now_ms,
     ) -> None:
         self._engine = engine
         self._rules = rules
         self._accounts = accounts
         self._prices = prices
         self._rate_limiter = rate_limiter
+        self._clock = clock
 
     async def check(self, order: Order) -> RiskDecision:
         """Return the decision for ``order``; on ACCEPT its quantity is reserved.
@@ -66,13 +76,17 @@ class PreTradeService:
             orders_in_window = await self._rate_limiter.hit(order.account)
 
             async def decide(snapshot: AccountSnapshot) -> RiskDecision:
-                prices = await self._prices.get_many(snapshot.symbols() | {order.symbol})
+                quotes = await self._prices.get_many(snapshot.symbols() | {order.symbol})
+                quote = quotes.get(order.symbol)
                 ctx = CheckContext(
                     order=order,
                     limits=limits,
-                    reference_price=prices.get(order.symbol),
+                    reference_price=quote.price if quote else None,
+                    reference_price_age_ms=_age_ms(quote, self._clock()),
                     position=snapshot.directional_position(order.symbol, order.side),
-                    gross_exposure=gross_exposure(snapshot, prices),
+                    gross_exposure=gross_exposure(
+                        snapshot, {symbol: q.price for symbol, q in quotes.items()}
+                    ),
                     orders_in_window=orders_in_window,
                 )
                 return self._engine.evaluate(ctx, rules_version=rules.version)

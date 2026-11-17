@@ -67,6 +67,8 @@ class SetPriceRequest(DomainModel):
 class PriceResponse(DomainModel):
     symbol: Symbol
     price: DecimalStr
+    updated_at: datetime | None
+    """When the service received this price; null for prices stored before timestamps existed."""
 
 
 class RejectedRulesFile(DomainModel):
@@ -98,5 +100,6 @@ class EffectiveLimitsResponse(DomainModel):
     max_position: DecimalStr
     max_gross_exposure: DecimalStr
     max_orders_per_second: int
+    max_price_age_seconds: int
     symbol_restricted: bool
     trading_halted_by: str | None

@@ -13,5 +13,6 @@ class EffectiveLimits:
     max_position: Decimal
     max_gross_exposure: Decimal
     max_orders_per_second: int
+    max_price_age_seconds: int
     symbol_restricted: bool = False
     trading_halted_by: Literal["global", "account"] | None = None

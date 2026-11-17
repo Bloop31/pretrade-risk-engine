@@ -1,8 +1,14 @@
 """Pre-trade checks and the order lifecycle that releases reserved risk."""
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from risk_service.api.deps import AccountPath, AccountsDep, ClientOrderIdPath, PreTradeDep
+from risk_service.api.deps import (
+    AccountPath,
+    AccountsDep,
+    ClientOrderIdPath,
+    PreTradeDep,
+    require_api_key,
+)
 from risk_service.api.errors import ErrorResponse
 from risk_service.api.schemas import (
     CancelResponse,
@@ -12,7 +18,7 @@ from risk_service.api.schemas import (
 )
 from risk_service.domain.models import Order, RiskDecision
 
-router = APIRouter(prefix="/v1/orders", tags=["orders"])
+router = APIRouter(prefix="/v1/orders", tags=["orders"], dependencies=[Depends(require_api_key)])
 
 
 @router.post(

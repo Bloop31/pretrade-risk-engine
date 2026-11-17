@@ -8,6 +8,7 @@ account's keys land in the same Redis Cluster slot; that is what lets one
 key                                         type    contents
 ==========================================  ======  ==========================================
 ``risk:prices``                             hash    symbol -> last price
+``risk:prices:updated_ms``                  hash    symbol -> when that price was written (ms)
 ``risk:{acct}:positions``                   hash    symbol -> filled signed net position
 ``risk:{acct}:open``                        hash    ``BUY:<symbol>`` / ``SELL:<symbol>`` -> open qty
 ``risk:{acct}:order:<client_order_id>``     hash    one accepted, not fully filled order
@@ -21,6 +22,7 @@ from risk_service.domain.models import Side
 
 PREFIX = "risk"
 PRICES_KEY = f"{PREFIX}:prices"
+PRICES_UPDATED_KEY = f"{PREFIX}:prices:updated_ms"
 
 
 def _account(account: str) -> str:

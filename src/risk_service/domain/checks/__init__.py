@@ -11,6 +11,7 @@ from risk_service.domain.checks.max_order_quantity import max_order_quantity
 from risk_service.domain.checks.max_position import max_position
 from risk_service.domain.checks.order_rate import order_rate
 from risk_service.domain.checks.price_collar import price_collar
+from risk_service.domain.checks.reference_price_fresh import reference_price_fresh
 from risk_service.domain.checks.restricted_symbol import restricted_symbol
 from risk_service.domain.checks.trading_enabled import trading_enabled
 
@@ -18,6 +19,7 @@ DEFAULT_CHECKS: tuple[RiskCheck, ...] = (
     trading_enabled,
     restricted_symbol,
     order_rate,
+    reference_price_fresh,
     max_order_quantity,
     max_order_notional,
     price_collar,
@@ -35,6 +37,7 @@ __all__ = [
     "max_position",
     "order_rate",
     "price_collar",
+    "reference_price_fresh",
     "restricted_symbol",
     "risk_check",
     "trading_enabled",

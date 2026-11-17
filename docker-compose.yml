@@ -1,3 +1,6 @@
+# Local / CI stack. The default keys below are for development only: set
+# API_KEYS and ADMIN_API_KEY in your environment (or a .env file) for anything
+# else, and put Redis behind a password or ACL user (see README, "Securing it").
 services:
   redis:
     image: redis:7
@@ -19,7 +22,8 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ADMIN_API_KEY: ${ADMIN_API_KEY:-change-me}
+      API_KEYS: ${API_KEYS:-dev-client-key-change-me}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key-change-me}
     volumes:
       # Edit config/rules.yaml on the host; the service hot-reloads it.
       - ./config:/app/config:ro
