@@ -36,5 +36,5 @@ up: ## Start api + redis with docker compose
 down: ## Stop docker compose services
 	docker compose down
 
-loadtest: ## Fire load at a running service (see scripts/loadtest.py --help)
-	$(UV) run python scripts/loadtest.py
+loadtest: ## Load-test a running service, e.g. make loadtest ARGS="--requests 20000"
+	$(UV) run python scripts/loadtest.py $(ARGS)

@@ -1,0 +1,31 @@
+services:
+  redis:
+    image: redis:7
+    # AOF with fsync every second: positions and reservations survive a restart,
+    # losing at most about one second of updates.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-change-me}
+    volumes:
+      # Edit config/rules.yaml on the host; the service hot-reloads it.
+      - ./config:/app/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:

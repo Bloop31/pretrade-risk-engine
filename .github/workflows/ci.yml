@@ -14,8 +14,18 @@ permissions:
 
 jobs:
   check:
+    name: Lint, typecheck, test
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # Database 15 of the throwaway service container; the real-Redis tests refuse a non-empty db.
+      REDIS_TEST_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v4
 
@@ -33,5 +43,43 @@ jobs:
       - name: Typecheck
         run: make typecheck
 
-      - name: Test
+      - name: Test (unit, fakeredis and real Redis)
         run: make test
+
+  docker:
+    name: Docker image, compose smoke test and load test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Start api + redis
+        run: docker compose up --build --detach --wait --wait-timeout 120
+
+      - name: Smoke test
+        run: |
+          curl --fail --silent --show-error http://localhost:8000/health/ready
+          curl --fail --silent --show-error -X PUT http://localhost:8000/v1/prices/AAPL \
+            -H 'content-type: application/json' -d '{"price": "100"}'
+          curl --fail --silent --show-error -X POST http://localhost:8000/v1/orders/check \
+            -H 'content-type: application/json' \
+            -d '{"client_order_id":"smoke-1","account":"SMOKE","symbol":"AAPL","side":"BUY","order_type":"LIMIT","quantity":"10","price":"100"}' \
+            | tee /dev/stderr | grep -q '"decision":"ACCEPT"'
+
+      - name: Load test
+        run: |
+          uv sync --locked
+          make loadtest ARGS="--requests 5000 --concurrency 32"
+
+      - name: Service logs
+        if: always()
+        run: docker compose logs --no-color api | tail -n 100
+
+      - name: Stop
+        if: always()
+        run: docker compose down --volumes

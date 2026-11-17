@@ -28,7 +28,13 @@ def configure_logging(level: str = "INFO", *, json: bool = True) -> None:
         renderer = structlog.dev.ConsoleRenderer()
 
     structlog.configure(
-        processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+        processors=[
+            # Drop below-level events first, before paying for timestamps and rendering:
+            # the per-order decision log is on the hot path.
+            structlog.stdlib.filter_by_level,
+            *shared,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
